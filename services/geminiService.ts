@@ -82,13 +82,35 @@ const RESPONSE_SCHEMA = {
   required: ["trust", "decoding", "emotions", "advice"],
 };
 
+// Helper function to safely retrieve API key from various environments
+const getApiKey = (): string | undefined => {
+  // 1. Try Vite environment variable (Standard for Vercel/Netlify Vite deployments)
+  // @ts-ignore
+  if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_KEY) {
+    // @ts-ignore
+    return import.meta.env.VITE_API_KEY;
+  }
+  
+  // 2. Try Standard process.env (Node.js or Webpack polyfills)
+  try {
+    if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
+      return process.env.API_KEY;
+    }
+  } catch (e) {
+    // Ignore reference errors if process is not defined
+  }
+
+  return undefined;
+};
+
 export const analyzeChat = async (
   text: string,
   imageBase64?: string
 ): Promise<AnalysisResult> => {
-  const apiKey = process.env.API_KEY;
+  const apiKey = getApiKey();
+  
   if (!apiKey) {
-    throw new Error("API Key is missing.");
+    throw new Error("API Key 未配置。请在部署设置中添加环境变量 'VITE_API_KEY'。");
   }
 
   const ai = new GoogleGenAI({ apiKey });
