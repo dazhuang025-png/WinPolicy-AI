@@ -103,6 +103,9 @@ const getApiKey = (): string | undefined => {
   return undefined;
 };
 
+// Sleep helper
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 export const analyzeChat = async (
   text: string,
   imageBase64?: string
@@ -135,34 +138,84 @@ export const analyzeChat = async (
     throw new Error("请提供聊天文字或截图。");
   }
 
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: {
-        role: "user",
-        parts: parts,
-      },
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: "application/json",
-        responseSchema: RESPONSE_SCHEMA,
-        // Critical for insurance context: disable safety filters to allow words like "death", "illness", "hospital"
-        safetySettings: [
-          { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-          { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-          { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-          { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-        ],
-      },
-    });
+  // Retry Loop
+  let lastError: any;
+  const maxAttempts = 3;
 
-    if (response.text) {
-      return JSON.parse(response.text) as AnalysisResult;
-    } else {
-      throw new Error("未能生成分析结果。");
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: {
+          role: "user",
+          parts: parts,
+        },
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          responseMimeType: "application/json",
+          responseSchema: RESPONSE_SCHEMA,
+          // Critical for insurance context: disable safety filters to allow words like "death", "illness", "hospital"
+          safetySettings: [
+            { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+            { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+            { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+            { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+          ],
+        },
+      });
+
+      if (response.text) {
+        return JSON.parse(response.text) as AnalysisResult;
+      } else {
+        throw new Error("未能生成分析结果。");
+      }
+    } catch (error: any) {
+      lastError = error;
+      console.warn(`Gemini API Attempt ${attempt} failed:`, error);
+
+      // Check for 503 (Overloaded) or 429 (Too Many Requests) or generic "overloaded" message
+      const isOverloaded = 
+        error.message?.includes('503') || 
+        error.message?.toLowerCase().includes('overloaded') || 
+        JSON.stringify(error).includes('503');
+
+      // If overloaded and not last attempt, wait and retry
+      if (isOverloaded && attempt < maxAttempts) {
+        const waitTime = attempt * 1500; // 1.5s, 3s
+        console.log(`Model overloaded. Retrying in ${waitTime}ms...`);
+        await sleep(waitTime);
+        continue;
+      }
+
+      // If it's not an overload error, or we ran out of attempts, break loop to throw error
+      break;
     }
-  } catch (error) {
-    console.error("Gemini Analysis Error:", error);
-    throw error;
   }
+
+  // Format error for UI
+  let friendlyMessage = "分析失败，请稍后重试。";
+  
+  if (lastError) {
+    const errorStr = lastError.message || JSON.stringify(lastError);
+    
+    if (errorStr.includes('503') || errorStr.toLowerCase().includes('overloaded')) {
+      friendlyMessage = "🔥 AI 大脑正在高速运转（服务器繁忙），请休息 10 秒钟再试一次！";
+    } else {
+       // Try to parse clean message from JSON string if possible
+       try {
+         if (typeof lastError.message === 'string' && lastError.message.startsWith('{')) {
+            const parsed = JSON.parse(lastError.message);
+            if (parsed.error?.message) {
+              friendlyMessage = parsed.error.message;
+            }
+         } else {
+            friendlyMessage = lastError.message;
+         }
+       } catch {
+         friendlyMessage = lastError.message || "未知网络错误";
+       }
+    }
+  }
+
+  throw new Error(friendlyMessage);
 };
