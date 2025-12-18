@@ -29,6 +29,12 @@ export interface AnalysisResult {
   advice: Advice;
 }
 
+export interface ChatMessage {
+  role: 'user' | 'neo';
+  content: string;
+  id: string;
+}
+
 export enum LoadingState {
   IDLE = 'IDLE',
   ANALYZING = 'ANALYZING',

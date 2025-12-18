@@ -1,10 +1,29 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { analyzeChat } from './services/geminiService';
-import { AnalysisResult, LoadingState } from './types';
+import { GoogleGenAI, Modality } from "@google/genai";
+import { analyzeChat, askNeo, getApiKey, encodeAudio, decodeAudio, decodeAudioData } from './services/geminiService';
+import { AnalysisResult, LoadingState, ChatMessage } from './types';
 import Dashboard from './components/Dashboard';
-import { Send, Upload, X, Bot, Sparkles, Trash2, History, ChevronRight, Clock, Lock, KeyRound, ShieldCheck, LogOut } from 'lucide-react';
+import { 
+  Send, 
+  Upload, 
+  X, 
+  Bot, 
+  History, 
+  Lock, 
+  ShieldCheck, 
+  User, 
+  Loader2, 
+  Sword, 
+  Users,
+  MessageSquareText,
+  Trash2,
+  Phone,
+  PhoneOff,
+  Mic,
+  MicOff,
+  Info
+} from 'lucide-react';
 
-// Wrapper type for history items
 interface HistoryItem {
   id: string;
   timestamp: number;
@@ -13,52 +32,61 @@ interface HistoryItem {
 }
 
 const App: React.FC = () => {
-  // Auth State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [passwordInput, setPasswordInput] = useState('');
   const [authError, setAuthError] = useState(false);
+  const [activeTab, setActiveTab] = useState<'COMBAT' | 'PARTNER'>('COMBAT');
 
-  // App State
+  // Voice State
+  const [isVoiceActive, setIsVoiceActive] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const liveSessionRef = useRef<any>(null);
+  const nextStartTimeRef = useRef<number>(0);
+  const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+
+  // Analysis State
   const [inputText, setInputText] = useState('');
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [loadingState, setLoadingState] = useState<LoadingState>(LoadingState.IDLE);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   
-  // History State
+  // Chat State
+  const [mentorMessages, setMentorMessages] = useState<ChatMessage[]>([{
+    id: 'partner-welcome',
+    role: 'neo',
+    content: '嫂夫人好，我是 Neo。今天在外面跑业务辛苦了，请问我有什么可以帮您，随时为您效劳。'
+  }]);
+  const [combatMessages, setCombatMessages] = useState<ChatMessage[]>([]);
+  const [userQuestion, setUserQuestion] = useState('');
+  const [isAsking, setIsAsking] = useState(false);
+
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [showHistory, setShowHistory] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
 
-  // Load history and auth state
   useEffect(() => {
-    // Check Auth
     const isUnlocked = localStorage.getItem('neo_app_unlocked');
-    if (isUnlocked === 'true') {
-      setIsAuthenticated(true);
-    }
-
-    // Check History
+    if (isUnlocked === 'true') setIsAuthenticated(true);
     const saved = localStorage.getItem('sales_history');
-    if (saved) {
-      try {
-        setHistory(JSON.parse(saved));
-      } catch (e) {
-        console.error("Failed to parse history", e);
-      }
-    }
+    if (saved) { try { setHistory(JSON.parse(saved)); } catch (e) {} }
   }, []);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [mentorMessages, combatMessages, isAsking, activeTab]);
 
   const handleLogin = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (passwordInput === 'xiuxiu') {
       setIsAuthenticated(true);
-      setAuthError(false);
       localStorage.setItem('neo_app_unlocked', 'true');
     } else {
       setAuthError(true);
-      // Reset error animation after a bit
       setTimeout(() => setAuthError(false), 500);
     }
   };
@@ -66,359 +94,345 @@ const App: React.FC = () => {
   const handleLogout = () => {
     setIsAuthenticated(false);
     localStorage.removeItem('neo_app_unlocked');
-    setPasswordInput('');
-    setShowHistory(false);
   };
 
-  const saveToHistory = (data: AnalysisResult, textPreview: string) => {
-    const newItem: HistoryItem = {
-      id: Date.now().toString(),
-      timestamp: Date.now(),
-      preview: textPreview.slice(0, 30) || "图片分析案例",
-      result: data
-    };
-    const newHistory = [newItem, ...history].slice(0, 20); // Keep last 20
-    setHistory(newHistory);
-    localStorage.setItem('sales_history', JSON.stringify(newHistory));
-  };
-
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setSelectedImage(reader.result as string);
-      };
-      reader.readAsDataURL(file);
+  // --- Voice Connection Logic ---
+  const startVoiceCall = async () => {
+    const apiKey = getApiKey();
+    if (!apiKey) {
+      alert("API Key 未配置");
+      return;
     }
+
+    try {
+      setIsVoiceActive(true);
+      const ai = new GoogleGenAI({ apiKey });
+      
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      const sessionPromise = ai.live.connect({
+        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+        callbacks: {
+          onopen: () => {
+            const source = audioContextRef.current!.createMediaStreamSource(stream);
+            const scriptProcessor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
+            scriptProcessor.onaudioprocess = (e) => {
+              if (isMuted) return;
+              const inputData = e.inputBuffer.getChannelData(0);
+              const l = inputData.length;
+              const int16 = new Int16Array(l);
+              for (let i = 0; i < l; i++) {
+                int16[i] = inputData[i] * 32768;
+              }
+              const pcmBlob = {
+                data: encodeAudio(new Uint8Array(int16.buffer)),
+                mimeType: 'audio/pcm;rate=16000',
+              };
+              sessionPromise.then(s => s.sendRealtimeInput({ media: pcmBlob }));
+            };
+            source.connect(scriptProcessor);
+            scriptProcessor.connect(audioContextRef.current!.destination);
+          },
+          onmessage: async (message: any) => {
+            if (message.serverContent?.outputTranscription) {
+              setMentorMessages(prev => {
+                const last = prev[prev.length - 1];
+                if (last?.role === 'neo' && last.id.startsWith('live-')) {
+                   return [...prev.slice(0, -1), { ...last, content: last.content + message.serverContent.outputTranscription.text }];
+                }
+                return [...prev, { id: 'live-' + Date.now(), role: 'neo', content: message.serverContent.outputTranscription.text }];
+              });
+            }
+
+            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (base64Audio && outputAudioContextRef.current) {
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputAudioContextRef.current.currentTime);
+              const audioBuffer = await decodeAudioData(decodeAudio(base64Audio), outputAudioContextRef.current, 24000, 1);
+              const source = outputAudioContextRef.current.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(outputAudioContextRef.current.destination);
+              source.addEventListener('ended', () => audioSourcesRef.current.delete(source));
+              source.start(nextStartTimeRef.current);
+              nextStartTimeRef.current += audioBuffer.duration;
+              audioSourcesRef.current.add(source);
+            }
+
+            if (message.serverContent?.interrupted) {
+              audioSourcesRef.current.forEach(s => s.stop());
+              audioSourcesRef.current.clear();
+              nextStartTimeRef.current = 0;
+            }
+          },
+          onerror: (e) => console.error("Live Error:", e),
+          onclose: () => stopVoiceCall()
+        },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
+          outputAudioTranscription: {},
+          systemInstruction: "你是 Neo，一位非常敬重、绅士且专业的展业伙伴。你正在和嫂夫人（保险业务员）进行通话。语气要极其得体、恭敬且专业，直接给出实用的建议和鼓励。你是她的得力助手，随时听候调遣。"
+        }
+      });
+
+      liveSessionRef.current = await sessionPromise;
+    } catch (err) {
+      console.error(err);
+      setIsVoiceActive(false);
+    }
+  };
+
+  const stopVoiceCall = () => {
+    if (liveSessionRef.current) {
+      try { liveSessionRef.current.close(); } catch (e) {}
+      liveSessionRef.current = null;
+    }
+    audioContextRef.current?.close();
+    outputAudioContextRef.current?.close();
+    setIsVoiceActive(false);
   };
 
   const handleAnalyze = async () => {
     if (!inputText && !selectedImage) return;
-
     setLoadingState(LoadingState.ANALYZING);
     setError(null);
     setResult(null);
-    setShowHistory(false); // Close history if open
-
+    setCombatMessages([]);
     try {
       const data = await analyzeChat(inputText, selectedImage || undefined);
       setResult(data);
       saveToHistory(data, inputText);
       setLoadingState(LoadingState.SUCCESS);
+      setCombatMessages([{
+        id: 'welcome',
+        role: 'neo',
+        content: `分析完了。阻力：${data.trust.resistance}，潜台词：${data.decoding[0]?.deep}。试试我的话术。`
+      }]);
     } catch (err: any) {
-      console.error(err);
-      setError(err.message || "分析对话失败，请重试。");
+      setError(err.message || "分析失败");
       setLoadingState(LoadingState.ERROR);
     }
   };
 
-  const clearAll = () => {
-    setInputText('');
-    setSelectedImage(null);
-    setResult(null);
-    setError(null);
-    setLoadingState(LoadingState.IDLE);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
+  const handleAskNeo = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!userQuestion.trim() || isAsking) return;
+    const question = userQuestion;
+    setUserQuestion('');
+    const newMessage: ChatMessage = { id: Date.now().toString(), role: 'user', content: question };
+    if (activeTab === 'COMBAT') setCombatMessages(prev => [...prev, newMessage]);
+    else setMentorMessages(prev => [...prev, newMessage]);
+    setIsAsking(true);
+    try {
+      const context = activeTab === 'COMBAT' ? (result || undefined) : undefined;
+      const historyToUse = activeTab === 'COMBAT' ? combatMessages : mentorMessages;
+      const answer = await askNeo(question, historyToUse, context);
+      const newNeoMsg: ChatMessage = { id: (Date.now() + 1).toString(), role: 'neo', content: answer };
+      if (activeTab === 'COMBAT') setCombatMessages(prev => [...prev, newNeoMsg]);
+      else setMentorMessages(prev => [...prev, newNeoMsg]);
+    } catch (err: any) { setError("伙伴 Neo 掉线了，稍后再试。"); } finally { setIsAsking(false); }
+  };
+
+  const saveToHistory = (data: AnalysisResult, textPreview: string) => {
+    const newItem = { id: Date.now().toString(), timestamp: Date.now(), preview: textPreview.slice(0, 30) || "案例分析", result: data };
+    const newHistory = [newItem, ...history].slice(0, 20);
+    setHistory(newHistory);
+    localStorage.setItem('sales_history', JSON.stringify(newHistory));
   };
 
   const loadHistoryItem = (item: HistoryItem) => {
     setResult(item.result);
     setLoadingState(LoadingState.SUCCESS);
+    setActiveTab('COMBAT');
     setShowHistory(false);
-    setInputText(''); 
-    setSelectedImage(null);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    setCombatMessages([{ id: 'history-welcome', role: 'neo', content: `这是之前的案例，有什么新动态吗？` }]);
   };
 
-  const deleteHistoryItem = (e: React.MouseEvent, id: string) => {
-    e.stopPropagation();
-    const newHistory = history.filter(h => h.id !== id);
-    setHistory(newHistory);
-    localStorage.setItem('sales_history', JSON.stringify(newHistory));
-  };
-
-  // --- LOCK SCREEN RENDER ---
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-        <div className="w-full max-w-sm bg-white rounded-2xl shadow-xl border border-slate-100 overflow-hidden animate-in fade-in zoom-in duration-500">
-          <div className="bg-slate-900 p-8 text-center relative overflow-hidden">
-             <div className="absolute top-0 left-0 w-full h-full opacity-10 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-blue-400 via-slate-900 to-slate-900"></div>
-             <div className="relative z-10 flex justify-center mb-4">
-               <div className="bg-slate-800 p-3 rounded-full border-2 border-slate-700 shadow-lg">
-                 <ShieldCheck className="w-8 h-8 text-blue-400" />
-               </div>
-             </div>
-             <h2 className="text-xl font-bold text-white relative z-10">AI 展业大脑</h2>
-             <p className="text-slate-400 text-xs mt-1 uppercase tracking-widest relative z-10">Internal Access Only</p>
+        <div className="w-full max-w-sm bg-white rounded-2xl shadow-xl border border-slate-100 overflow-hidden">
+          <div className="bg-slate-900 p-8 text-center">
+             <ShieldCheck className="w-8 h-8 text-blue-400 mx-auto mb-4" />
+             <h2 className="text-xl font-bold text-white tracking-tight">AI 展业大脑</h2>
           </div>
-          
           <div className="p-8">
             <form onSubmit={handleLogin} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase mb-2 ml-1">
-                  身份验证密码
-                </label>
-                <div className="relative">
-                  <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
-                  <input 
-                    type="password" 
-                    value={passwordInput}
-                    onChange={(e) => setPasswordInput(e.target.value)}
-                    className={`w-full pl-10 pr-4 py-3 bg-slate-50 border rounded-xl outline-none transition-all
-                      ${authError 
-                        ? 'border-red-300 focus:border-red-500 focus:ring-2 focus:ring-red-200 animate-pulse text-red-600' 
-                        : 'border-slate-200 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 text-slate-800'
-                      }`}
-                    placeholder="请输入访问口令"
-                  />
-                </div>
-                {authError && (
-                  <p className="text-red-500 text-xs mt-2 ml-1 animate-in slide-in-from-left-2">
-                    口令错误，请重试
-                  </p>
-                )}
-              </div>
-              <button 
-                type="submit"
-                className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl shadow-lg hover:bg-slate-800 active:scale-95 transition-all flex items-center justify-center gap-2"
-              >
-                解锁系统 <ChevronRight className="w-4 h-4" />
-              </button>
+              <input type="password" value={passwordInput} onChange={(e) => setPasswordInput(e.target.value)}
+                className={`w-full px-4 py-3 bg-slate-50 border rounded-xl outline-none transition-all ${authError ? 'border-red-500 animate-shake' : 'border-slate-200 focus:border-blue-500'}`} placeholder="请输入口令" />
+              <button type="submit" className="w-full bg-slate-900 text-white font-bold py-3 rounded-xl hover:bg-slate-800 transition-colors">解锁展业助手</button>
             </form>
-            <p className="text-center text-[10px] text-slate-300 mt-6">
-              Powered by Gemini 2.5 • 平安精英实战版
-            </p>
           </div>
         </div>
       </div>
     );
   }
 
-  // --- MAIN APP RENDER ---
   return (
-    <div className="min-h-screen bg-slate-50 pb-safe">
-      {/* Header */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-40 safe-top shadow-sm">
-        <div className="max-w-4xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2" onClick={() => {setResult(null); setLoadingState(LoadingState.IDLE);}} role="button">
-            <div className="bg-slate-900 p-1.5 rounded-lg shadow-sm">
-              <Bot className="w-5 h-5 text-white" />
+    <div className="min-h-screen bg-slate-50 flex flex-col h-screen overflow-hidden">
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-40 safe-top shrink-0">
+        <div className="max-w-4xl mx-auto px-4 py-3">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <div className="bg-slate-900 p-1 rounded-lg">
+                <Bot className="w-4 h-4 text-white" />
+              </div>
+              <h1 className="text-lg font-bold text-slate-900">AI 展业大脑</h1>
             </div>
-            <div>
-              <h1 className="text-lg font-bold text-slate-900 leading-tight">AI 展业大脑</h1>
-              <p className="text-[10px] text-slate-500 font-medium leading-none">一键成交系统</p>
+            <div className="flex items-center gap-1">
+              <button onClick={() => setShowHistory(true)} className="p-2 text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"><History className="w-5 h-5" /></button>
+              <button onClick={handleLogout} className="p-2 text-slate-400 rounded-lg hover:bg-slate-100"><Lock className="w-5 h-5" /></button>
             </div>
           </div>
-          <div className="flex items-center gap-2 sm:gap-3">
-            <div className="hidden sm:block">
-              <span className="bg-orange-50 text-orange-700 text-xs px-3 py-1 rounded-full font-semibold border border-orange-100 shadow-sm">
-                平安精英实战版
-              </span>
-            </div>
-            
-            <button 
-              onClick={() => setShowHistory(!showHistory)}
-              className={`p-2 rounded-lg transition-colors relative ${showHistory ? 'bg-blue-100 text-blue-700' : 'hover:bg-slate-100 text-slate-600'}`}
-              title="历史战绩"
-            >
-              <History className="w-5 h-5" />
-              {history.length > 0 && (
-                <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full border border-white"></span>
-              )}
-            </button>
-
-            <button 
-              onClick={handleLogout}
-              className="p-2 hover:bg-red-50 text-slate-400 hover:text-red-600 rounded-lg transition-colors"
-              title="锁定屏幕"
-            >
-              <Lock className="w-5 h-5" />
-            </button>
+          <div className="flex bg-slate-100 p-1 rounded-xl">
+             <button onClick={() => { stopVoiceCall(); setActiveTab('COMBAT'); }} className={`flex-1 flex items-center justify-center gap-2 py-2 text-sm font-bold rounded-lg transition-all ${activeTab === 'COMBAT' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-500'}`}><Sword className="w-4 h-4" /> 案例实战</button>
+             <button onClick={() => setActiveTab('PARTNER')} className={`flex-1 flex items-center justify-center gap-2 py-2 text-sm font-bold rounded-lg transition-all ${activeTab === 'PARTNER' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-500'}`}><Users className="w-4 h-4" /> 展业伙伴</button>
           </div>
         </div>
       </header>
 
-      {/* History Slide-over/Drawer - Mobile Optimized */}
+      {/* History Sidebar */}
       {showHistory && (
         <div className="fixed inset-0 z-50 flex justify-end">
-           {/* Backdrop */}
            <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setShowHistory(false)}></div>
-           
-           {/* Drawer */}
-           <div className="relative w-full max-w-xs sm:max-w-sm bg-white h-full shadow-2xl animate-in slide-in-from-right duration-300 flex flex-col">
-              <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 pt-safe-top">
-                <h3 className="font-bold text-slate-800 flex items-center gap-2">
-                  <History className="w-4 h-4" /> 历史战绩
-                </h3>
-                <button onClick={() => setShowHistory(false)} className="p-2 hover:bg-slate-200 rounded-full -mr-2">
-                  <X className="w-5 h-5 text-slate-500" />
-                </button>
-              </div>
-              <div className="flex-1 overflow-y-auto p-4 space-y-3 pb-20">
+           <div className="relative w-full max-w-xs bg-white h-full shadow-2xl flex flex-col p-4 animate-in slide-in-from-right duration-300">
+              <h3 className="font-bold mb-6 text-slate-900">历史战绩</h3>
+              <div className="flex-1 overflow-y-auto space-y-3 no-scrollbar">
                 {history.length === 0 ? (
-                  <div className="text-center text-slate-400 py-10">
-                    <p>暂无历史记录</p>
-                    <p className="text-xs mt-1">快去分析第一单吧！</p>
+                  <div className="text-center py-20 text-slate-400 text-sm">暂无记录</div>
+                ) : history.map(h => (
+                  <div key={h.id} onClick={() => loadHistoryItem(h)} className="p-3 border rounded-xl hover:bg-slate-50 transition-colors cursor-pointer group">
+                    <p className="text-sm font-medium line-clamp-2 text-slate-700 group-hover:text-blue-600">"{h.preview}"</p>
+                    <span className="text-[10px] text-slate-400 mt-1 block">{new Date(h.timestamp).toLocaleDateString()}</span>
                   </div>
-                ) : (
-                  history.map((item) => (
-                    <div 
-                      key={item.id}
-                      onClick={() => loadHistoryItem(item)}
-                      className="bg-white border border-slate-200 rounded-xl p-3 active:bg-slate-50 active:scale-[0.98] transition-all cursor-pointer group relative shadow-sm"
-                    >
-                      <div className="flex justify-between items-start mb-2">
-                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
-                           item.result.trust.resistance === 'Green' ? 'bg-green-100 text-green-700' :
-                           item.result.trust.resistance === 'Yellow' ? 'bg-yellow-100 text-yellow-700' :
-                           'bg-red-100 text-red-700'
-                        }`}>
-                          信任分: {item.result.trust.score}
-                        </span>
-                        <span className="text-[10px] text-slate-400 flex items-center gap-1">
-                          <Clock className="w-3 h-3" />
-                          {new Date(item.timestamp).toLocaleDateString()}
-                        </span>
-                      </div>
-                      <p className="text-sm text-slate-700 font-medium line-clamp-2 mb-2">
-                        "{item.preview}"
-                      </p>
-                      <div className="flex justify-between items-center border-t border-slate-50 pt-2 mt-2">
-                         <span className="text-xs text-blue-600 flex items-center">
-                            查看策略 <ChevronRight className="w-3 h-3 ml-1" />
-                         </span>
-                         <button 
-                            onClick={(e) => deleteHistoryItem(e, item.id)}
-                            className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded -mb-1 -mr-1"
-                            title="删除"
-                         >
-                           <Trash2 className="w-4 h-4" />
-                         </button>
-                      </div>
-                    </div>
-                  ))
-                )}
+                ))}
               </div>
+              <button onClick={() => { setHistory([]); localStorage.removeItem('sales_history'); }} className="mt-4 text-red-500 text-sm py-3 border border-red-100 rounded-xl hover:bg-red-50 transition-colors">清空历史</button>
            </div>
         </div>
       )}
 
-      <main className="max-w-4xl mx-auto px-4 pt-6 pb-20">
-        
-        {/* Intro Text - Hide on mobile if result exists to save space */}
-        {loadingState === LoadingState.IDLE && !result && (
-          <div className="mb-6 text-center max-w-2xl mx-auto animate-in slide-in-from-bottom-4 duration-700">
-            <h2 className="text-2xl sm:text-3xl font-extrabold text-slate-900 mb-2">
-              洞察人性 · 锁定保单
-            </h2>
-            <p className="text-slate-600 text-sm sm:text-lg px-4">
-              上传聊天记录，深度解码客户心理，定制<b>平安销冠</b>话术。
+      {/* Voice Call Overlay */}
+      {isVoiceActive && (
+        <div className="fixed inset-0 z-[60] bg-slate-900 flex flex-col items-center justify-center p-8 transition-all">
+          <div className="relative mb-12">
+            <div className="absolute inset-0 bg-blue-500/10 blur-3xl animate-pulse rounded-full"></div>
+            <div className="relative w-48 h-48 rounded-full bg-slate-800 flex items-center justify-center border-4 border-slate-700 shadow-2xl overflow-hidden">
+              <div className="absolute inset-0 opacity-20">
+                <div className="w-full h-full bg-gradient-to-t from-blue-500 to-transparent animate-pulse"></div>
+              </div>
+              <Bot className="w-16 h-16 text-blue-400 relative z-10" />
+            </div>
+          </div>
+          
+          <div className="text-center mb-12">
+            <h2 className="text-2xl font-bold text-white mb-2">正在为嫂夫人连线 Neo</h2>
+            <div className="flex items-center justify-center gap-1.5 text-blue-400 text-sm">
+               <span className="w-2 h-2 bg-blue-400 rounded-full animate-ping"></span>
+               实时对谈中...
+            </div>
+            <p className="mt-8 text-slate-500 text-xs flex items-center justify-center gap-1">
+              <Info className="w-3 h-3" /> 语音模式消耗额度较多，建议按需使用
             </p>
           </div>
-        )}
 
-        {/* Input Section - Mobile Optimized */}
-        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-1 mb-6 transition-all focus-within:ring-2 focus-within:ring-blue-500/20 relative group">
-          <textarea
-            className="w-full p-4 min-h-[140px] outline-none text-slate-700 text-base resize-y rounded-t-xl bg-transparent placeholder:text-slate-400"
-            placeholder="在此粘贴微信聊天记录..."
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-            style={{ fontSize: '16px' }} // Prevent iOS zoom
-          />
-
-           {/* Clear Button */}
-           {(inputText || selectedImage) && (
-            <button 
-              onClick={clearAll}
-              className="absolute top-2 right-2 p-2 bg-slate-100 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors z-10"
-              title="一键清空"
-            >
-              <Trash2 className="w-4 h-4" />
+          <div className="flex gap-6">
+            <button onClick={() => setIsMuted(!isMuted)} className={`p-5 rounded-full transition-all ${isMuted ? 'bg-red-500 text-white' : 'bg-slate-800 text-slate-300'}`}>
+               {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
             </button>
-           )}
-          
-          {selectedImage && (
-            <div className="px-4 pb-4">
-              <div className="relative inline-block">
-                <img 
-                  src={selectedImage} 
-                  alt="Chat Screenshot" 
-                  className="h-32 w-auto rounded-lg border border-slate-200 object-cover"
-                />
-                <button 
-                  onClick={() => {setSelectedImage(null); if(fileInputRef.current) fileInputRef.current.value='';}}
-                  className="absolute -top-2 -right-2 bg-slate-900 text-white rounded-full p-1.5 shadow-md z-10"
-                >
-                  <X className="w-3 h-3" />
-                </button>
-              </div>
-            </div>
-          )}
-
-          <div className="flex items-center justify-between px-3 py-2 border-t border-slate-100 bg-slate-50/50 rounded-b-xl">
-            <div className="flex items-center gap-2">
-              <input
-                type="file"
-                accept="image/*"
-                className="hidden"
-                ref={fileInputRef}
-                onChange={handleImageUpload}
-              />
-              <button 
-                onClick={() => fileInputRef.current?.click()}
-                className="p-2 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium active:bg-slate-200"
-              >
-                <Upload className="w-5 h-5" />
-                <span className="hidden sm:inline">上传截图</span>
-              </button>
-            </div>
-            
-            <button
-              onClick={handleAnalyze}
-              disabled={loadingState === LoadingState.ANALYZING || (!inputText && !selectedImage)}
-              className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-white shadow-md transition-all active:scale-95
-                ${loadingState === LoadingState.ANALYZING || (!inputText && !selectedImage)
-                  ? 'bg-slate-300 cursor-not-allowed shadow-none' 
-                  : 'bg-blue-600 hover:bg-blue-700 hover:shadow-lg'
-                }`}
-            >
-              {loadingState === LoadingState.ANALYZING ? (
-                <>
-                  <Sparkles className="w-4 h-4 animate-spin" />
-                  <span className="hidden sm:inline">AI 运算中...</span>
-                  <span className="sm:hidden">分析中...</span>
-                </>
-              ) : (
-                <>
-                  <Send className="w-4 h-4" />
-                  <span className="hidden sm:inline">一键生成策略</span>
-                  <span className="sm:hidden">生成策略</span>
-                </>
-              )}
+            <button onClick={stopVoiceCall} className="p-5 rounded-full bg-red-600 text-white shadow-xl hover:bg-red-700 active:scale-90 transition-all">
+               <PhoneOff className="w-8 h-8" />
             </button>
           </div>
         </div>
+      )}
 
-        {/* Error Message */}
-        {error && (
-          <div className="bg-red-50 text-red-600 p-4 rounded-xl border border-red-200 mb-8 flex items-center gap-3 animate-in fade-in">
-             <div className="w-2 h-2 rounded-full bg-red-500 shrink-0"></div>
-             <p className="text-sm">{error}</p>
-          </div>
-        )}
+      <main className="flex-1 overflow-y-auto no-scrollbar">
+        <div className="max-w-4xl mx-auto px-4 py-6">
+          {activeTab === 'COMBAT' ? (
+            <div className="space-y-6">
+              <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-1">
+                <textarea className="w-full p-4 min-h-[120px] outline-none text-slate-700 text-base resize-none" placeholder="粘贴聊天记录或上传截图，Neo 帮你拆解..." value={inputText} onChange={(e) => setInputText(e.target.value)} />
+                {selectedImage && <div className="px-4 pb-2"><img src={selectedImage} className="h-24 rounded-lg border shadow-sm" /></div>}
+                <div className="flex justify-between items-center p-3 border-t bg-slate-50/50 rounded-b-2xl">
+                  <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2 px-3 py-2 text-slate-600 hover:bg-slate-200 rounded-xl transition-colors"><Upload className="w-5 h-5" />上传</button>
+                  <button onClick={handleAnalyze} disabled={loadingState === LoadingState.ANALYZING || (!inputText && !selectedImage)} className="bg-slate-900 text-white px-6 py-2.5 rounded-xl font-bold flex items-center gap-2 shadow-md active:scale-95 transition-all">
+                    {loadingState === LoadingState.ANALYZING ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sword className="w-4 h-4" />}
+                    开始攻单
+                  </button>
+                  <input type="file" ref={fileInputRef} hidden accept="image/*" onChange={(e) => {
+                    const f = e.target.files?.[0]; if(f) { const r = new FileReader(); r.onload = () => setSelectedImage(r.result as string); r.readAsDataURL(f); }
+                  }} />
+                </div>
+              </div>
+              {result && (
+                <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-12">
+                  <Dashboard data={result} />
+                  <div className="bg-white rounded-2xl shadow-lg border border-slate-200 overflow-hidden">
+                    <div className="bg-slate-900 px-6 py-4 flex items-center gap-3"><Bot className="w-6 h-6 text-blue-400" /><h3 className="text-white font-bold text-sm">针对本案咨询</h3></div>
+                    <div className="p-6 max-h-[400px] overflow-y-auto space-y-6 bg-slate-50/50">
+                        {combatMessages.map((msg) => (
+                          <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                             <div className={`p-4 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-white border border-slate-200 rounded-tl-none shadow-sm'}`}>{msg.content}</div>
+                          </div>
+                        ))}
+                        {isAsking && <div className="flex items-center gap-2 text-slate-400 text-xs px-2"><Loader2 className="w-3 h-3 animate-spin" /> Neo 正在打字...</div>}
+                        <div ref={chatEndRef} />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex flex-col h-full pb-12">
+               <div className="flex items-center justify-between mb-6 bg-gradient-to-r from-blue-600 to-indigo-600 p-5 rounded-2xl shadow-lg text-white">
+                 <div>
+                   <h3 className="font-bold flex items-center gap-2 text-lg"><Users className="w-5 h-5" /> 展业伙伴</h3>
+                   <p className="text-[10px] text-blue-100 opacity-80 uppercase tracking-[0.2em]">Sales Partner Engine</p>
+                 </div>
+                 <button onClick={startVoiceCall} className="bg-white/20 hover:bg-white/30 p-3 rounded-full transition-all active:scale-90 shadow-inner">
+                    <Phone className="w-6 h-6" />
+                 </button>
+               </div>
 
-        {/* Dashboard Results */}
-        {result && (
-          <div className="mb-20 animate-in slide-in-from-bottom-2 duration-500">
-            <Dashboard data={result} />
-          </div>
-        )}
+               <div className="flex-1 overflow-y-auto space-y-6 pb-6 no-scrollbar min-h-[400px]">
+                  {mentorMessages.map((msg) => (
+                    <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                       <div className={`flex gap-3 max-w-[85%] ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                          <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 shadow-sm ${msg.role === 'user' ? 'bg-slate-900' : 'bg-white border border-slate-100'}`}>
+                            {msg.role === 'user' ? <User className="w-5 h-5 text-white" /> : <Bot className="w-5 h-5 text-slate-700" />}
+                          </div>
+                          <div className={`p-4 rounded-2xl shadow-sm text-sm leading-relaxed ${msg.role === 'user' ? 'bg-slate-900 text-white rounded-tr-none' : 'bg-white border border-slate-100 rounded-tl-none text-slate-700'}`}>{msg.content}</div>
+                       </div>
+                    </div>
+                  ))}
+                  {isAsking && <div className="flex items-center gap-2 text-slate-400 text-xs px-12"><Loader2 className="w-3 h-3 animate-spin" /> Neo 正在组织语言...</div>}
+                  <div ref={chatEndRef} />
+               </div>
+            </div>
+          )}
+        </div>
       </main>
+
+      <footer className="bg-white border-t border-slate-100 p-4 pb-safe sticky bottom-0 z-40">
+        <div className="max-w-4xl mx-auto">
+           <form onSubmit={handleAskNeo} className="relative flex items-center gap-2">
+              <input type="text" className="w-full pl-5 pr-12 py-3.5 bg-slate-100 border-none rounded-2xl outline-none text-sm placeholder:text-slate-400" 
+                placeholder={activeTab === 'COMBAT' && !result ? "请先上传分析案例..." : "跟伙伴 Neo 聊聊..."} 
+                disabled={activeTab === 'COMBAT' && !result} value={userQuestion} onChange={(e) => setUserQuestion(e.target.value)} />
+              <button type="submit" disabled={!userQuestion.trim() || isAsking} className="bg-slate-900 text-white p-3 rounded-2xl shadow-lg hover:bg-slate-800 disabled:bg-slate-200 transition-all">
+                <Send className="w-5 h-5" />
+              </button>
+           </form>
+           <p className="text-[10px] text-center text-slate-400 mt-2">文字聊天更节省 API 额度哦</p>
+        </div>
+      </footer>
+
+      <style>{`
+        @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+        .animate-shake { animation: shake 0.2s ease-in-out 0s 2; }
+      `}</style>
     </div>
   );
 };
